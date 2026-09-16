@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -21,6 +22,10 @@ sealed interface ConnectionValidation {
 }
 
 class ProviderApiClient {
+    // Stable for this client's lifetime, mirroring OpenCodeZenProxy's per-conversation
+    // session header for the setup-time connection check below.
+    private val zenSetupSessionId = "setup_${UUID.randomUUID()}"
+
     suspend fun discoverModels(
         baseUrl: String,
         apiKey: String,
@@ -100,6 +105,15 @@ class ProviderApiClient {
                 if (protocol != ProviderProtocol.OPENROUTER && protocol != ProviderProtocol.OPENAI_CHAT && protocol != ProviderProtocol.OPENAI_RESPONSES) {
                     setRequestProperty("x-api-key", apiKey)
                     setRequestProperty("anthropic-version", "2023-06-01")
+                }
+                // OpenCode Zen's gateway expects requests to carry the identity its own
+                // official clients send (see OpenCodeZenProxy.kt, which does the same for
+                // real Claude Code traffic) — without it, completion requests can 500 even
+                // with a valid credential, though listing models doesn't need it.
+                if (URL(endpoint).host == "opencode.ai") {
+                    setRequestProperty("User-Agent", "opencode/latest/1.18.15/desktop")
+                    setRequestProperty("x-opencode-client", "desktop")
+                    setRequestProperty("x-opencode-session", zenSetupSessionId)
                 }
                 if (body != null) doOutput = true
             }

@@ -37,7 +37,12 @@ object RuntimeLaunchConfigBuilder {
                 environment["ANTHROPIC_MODEL"] = profile.model
             }
             com.ashim.ashforge.model.ProviderProtocol.ANTHROPIC_GATEWAY -> {
-                environment["ANTHROPIC_BASE_URL"] = profile.baseUrl.trimEnd('/')
+                if (profile.kind == com.ashim.ashforge.model.ProviderKind.OPENCODE_FREE) {
+                    require(!localGatewayUrl.isNullOrBlank()) { "The OpenCode Zen identity proxy is required for this provider" }
+                    environment["ANTHROPIC_BASE_URL"] = localGatewayUrl.trimEnd('/')
+                } else {
+                    environment["ANTHROPIC_BASE_URL"] = profile.baseUrl.trimEnd('/')
+                }
                 environment["ANTHROPIC_MODEL"] = profile.model
             }
             com.ashim.ashforge.model.ProviderProtocol.OPENROUTER -> {
