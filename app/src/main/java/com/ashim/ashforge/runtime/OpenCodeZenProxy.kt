@@ -88,7 +88,7 @@ internal class OpenCodeZenProxy(
             }
             val code = connection.responseCode
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val responseBytes = stream?.readBytes().orEmpty()
+            val responseBytes = stream?.readBytes() ?: ByteArray(0)
             val contentType = connection.contentType ?: "application/json"
             connection.disconnect()
             output.write("HTTP/1.1 $code ${if (code in 200..299) "OK" else "Error"}\r\n".toByteArray())
