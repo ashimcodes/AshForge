@@ -11,6 +11,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Needed so GITHUB_TOKEN can publish/update the "ci-latest" release below.
+    permissions:
+      contents: write
     # "secrets" isn't a valid context inside if: conditions, so the release
     # steps below check this env var (set from secrets here, where that IS
     # allowed) instead of referencing secrets.* directly in their if:.
@@ -46,12 +49,23 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: AshForge-debug
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+      # Published as a Release asset rather than an Actions artifact: Actions
+      # artifact storage is a small, separate quota that fills up fast and
+      # expires after 90 days. Release assets share the same storage as the
+      # runtime bundles you already publish, and the link never expires. The
+      # "ci-latest" tag is reused every run (--clobber overwrites the old
+      # APK) so you always have one stable link to the newest build.
+      - name: Publish debug APK to the "ci-latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/*.apk ash-forge-debug.apk
+          gh release view ci-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create ci-latest --repo "$GITHUB_REPOSITORY" \
+              --title "Latest CI build" \
+              --notes "Automatically rebuilt on every push to main. Not a stable release — see the runtime-2026.09.4 release for that." \
+              --prerelease
+          gh release upload ci-latest ash-forge-debug.apk --repo "$GITHUB_REPOSITORY" --clobber
 
       # Only runs once you've added the four secrets below under
       # Settings → Secrets and variables → Actions. See docs/RELEASE_BUILD.md.
@@ -68,10 +82,11 @@ jobs:
           MH_UPLOAD_KEY_PASSWORD: ${{ secrets.MH_UPLOAD_KEY_PASSWORD }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Upload release APK
+      - name: Publish signed release APK to the "ci-latest" release
         if: ${{ env.HAS_UPLOAD_SIGNING == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: AshForge-release
-          path: app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/*.apk ash-forge-release.apk
+          gh release upload ci-latest ash-forge-release.apk --repo "$GITHUB_REPOSITORY" --clobber
+          
