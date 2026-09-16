@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Ash Forge on Device",
+      "type": "shell",
+      "command": "./gradlew installDebug && adb shell am start -n com.ashim.ashforge/.MainActivity",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Unit Tests",
+      "type": "shell",
+      "command": "./gradlew test",
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}

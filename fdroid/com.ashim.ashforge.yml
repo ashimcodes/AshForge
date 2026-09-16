@@ -1,0 +1,31 @@
+Categories:
+  - Development
+  - System
+License: MIT
+AuthorName: Ash
+SourceCode: https://github.com/ashimcodes/AshForge
+IssueTracker: https://github.com/ashimcodes/AshForge/issues
+Changelog: https://github.com/ashimcodes/AshForge/releases
+
+AutoName: Ash Forge
+
+RepoType: git
+Repo: https://github.com/ashimcodes/AshForge.git
+
+AntiFeatures:
+  - NonFreeNet
+
+Builds:
+  - versionName: 1.0.2
+    versionCode: 3
+    commit: v1.0.2
+    subdir: app
+    ndk: r26b
+    submodules: true
+    gradle:
+      - yes
+
+AutoUpdateMode: Version v%v
+UpdateCheckMode: Tags
+CurrentVersion: 1.0.2
+CurrentVersionCode: 3

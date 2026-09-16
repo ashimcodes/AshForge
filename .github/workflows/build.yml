@@ -1,0 +1,77 @@
+name: Build Ash Forge APK
+
+# Single build variant — no more online/offline flavor split.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # "secrets" isn't a valid context inside if: conditions, so the release
+    # steps below check this env var (set from secrets here, where that IS
+    # allowed) instead of referencing secrets.* directly in their if:.
+    env:
+      HAS_UPLOAD_SIGNING: ${{ secrets.MH_UPLOAD_STORE_BASE64 != '' }}
+    steps:
+      - name: Check out repo (with proot/libandroid-shmem submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (with dependency caching)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install the NDK/CMake versions this project pins
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" \
+            "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # Always runs, no secrets required. Debug builds are auto-signed with
+      # the standard Android debug keystore, so this APK installs directly
+      # on a device with "install from unknown sources" enabled.
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AshForge-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Only runs once you've added the four secrets below under
+      # Settings → Secrets and variables → Actions. See docs/RELEASE_BUILD.md.
+      - name: Decode release keystore
+        if: ${{ env.HAS_UPLOAD_SIGNING == 'true' }}
+        run: echo "${{ secrets.MH_UPLOAD_STORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/upload-keystore.jks"
+
+      - name: Build signed release APK
+        if: ${{ env.HAS_UPLOAD_SIGNING == 'true' }}
+        env:
+          MH_UPLOAD_STORE_FILE: ${{ runner.temp }}/upload-keystore.jks
+          MH_UPLOAD_STORE_PASSWORD: ${{ secrets.MH_UPLOAD_STORE_PASSWORD }}
+          MH_UPLOAD_KEY_ALIAS: ${{ secrets.MH_UPLOAD_KEY_ALIAS }}
+          MH_UPLOAD_KEY_PASSWORD: ${{ secrets.MH_UPLOAD_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Upload release APK
+        if: ${{ env.HAS_UPLOAD_SIGNING == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AshForge-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error

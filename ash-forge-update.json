@@ -1,0 +1,12 @@
+{
+  "versionCode": 4,
+  "versionName": "1.0.3",
+  "notes": "OpenCode Free (no account needed), local server web preview, OpenRouter, DeepSeek and Kimi provider support, improved model discovery, in-app updates, and more reliable background runtime notifications.",
+  "artifacts": {
+    "app": {
+      "url": "https://github.com/ashimcodes/AshForge/releases/download/v1.0.3/ash-forge-v1.0.3.apk",
+      "sha256": "REPLACE_WITH_REAL_SHA256_AFTER_YOU_BUILD_AND_PUBLISH_THE_APK",
+      "sizeBytes": 0
+    }
+  }
+}

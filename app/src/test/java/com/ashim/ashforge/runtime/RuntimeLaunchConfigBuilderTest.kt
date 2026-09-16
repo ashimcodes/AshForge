@@ -1,0 +1,58 @@
+package com.ashim.ashforge.runtime
+
+import com.ashim.ashforge.model.ProviderKind
+import com.ashim.ashforge.model.ProviderProfile
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Test
+
+class RuntimeLaunchConfigBuilderTest {
+    @Test
+    fun gatewayProfileUsesCustomBaseUrlAndModel() {
+        val config = RuntimeLaunchConfigBuilder.build(
+            ProviderProfile(ProviderKind.LLM_ROUTER, "https://gateway.example/", "model-a", true),
+        )
+
+        assertEquals("https://gateway.example", config.environment["ANTHROPIC_BASE_URL"])
+        assertEquals("model-a", config.environment["ANTHROPIC_MODEL"])
+        assertEquals("1", config.environment["DISABLE_AUTOUPDATER"])
+        assertFalse(config.arguments.contains("--dangerously-skip-permissions"))
+    }
+
+    @Test
+    fun kimiUsesItsAnthropicCompatibleEndpointDirectly() {
+        val config = RuntimeLaunchConfigBuilder.build(ProviderProfile(ProviderKind.KIMI))
+
+        assertEquals("https://api.moonshot.ai/anthropic", config.environment["ANTHROPIC_BASE_URL"])
+        assertEquals("kimi-k2.6", config.environment["ANTHROPIC_MODEL"])
+    }
+
+    @Test
+    fun configuresEveryClaudeModelRoleAndInMemoryAuth() {
+        val config = RuntimeLaunchConfigBuilder.build(
+            ProviderProfile(ProviderKind.CUSTOM, "https://example.test/anthropic", "custom-model", true),
+            authToken = "temporary-secret",
+        )
+
+        assertEquals("custom-model", config.environment["ANTHROPIC_DEFAULT_OPUS_MODEL"])
+        assertEquals("custom-model", config.environment["ANTHROPIC_DEFAULT_SONNET_MODEL"])
+        assertEquals("custom-model", config.environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
+        assertEquals("custom-model", config.environment["CLAUDE_CODE_SUBAGENT_MODEL"])
+        assertEquals("1", config.environment["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"])
+        assertEquals("temporary-secret", config.environment["ANTHROPIC_AUTH_TOKEN"])
+        assertEquals("temporary-secret", config.environment["ANTHROPIC_API_KEY"])
+    }
+
+    @Test
+    fun openRouterMatchesVerifiedClaudeCodeEnvironment() {
+        val config = RuntimeLaunchConfigBuilder.build(
+            ProviderProfile(ProviderKind.LLM_ROUTER, "https://openrouter.ai/api/", "stealth/ox-alpha", true),
+            authToken = "temporary-openrouter-secret",
+        )
+
+        assertEquals("https://openrouter.ai/api", config.environment["ANTHROPIC_BASE_URL"])
+        assertEquals("temporary-openrouter-secret", config.environment["ANTHROPIC_AUTH_TOKEN"])
+        assertEquals("temporary-openrouter-secret", config.environment["OPENROUTER_API_KEY"])
+        assertEquals("", config.environment["ANTHROPIC_API_KEY"])
+    }
+}

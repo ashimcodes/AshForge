@@ -1,0 +1,1327 @@
+package com.ashim.ashforge.runtime
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.system.Os
+import com.ashim.ashforge.BuildConfig
+import java.io.BufferedInputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.util.zip.ZipInputStream
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeout
+import kotlin.coroutines.coroutineContext
+import com.ashim.ashforge.model.DevStack
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream
+import org.json.JSONObject
+
+data class InstalledRuntime(
+    val proot: File,
+    val rootfs: File,
+    val claude: File,
+    val version: String,
+)
+
+data class RuntimeInstallProgress(
+    val message: String,
+    val fraction: Float,
+    val downloadedBytes: Long? = null,
+    val totalBytes: Long? = null,
+    val terminalLine: String? = null,
+    val indeterminate: Boolean = false,
+    val event: RuntimeInstallEvent = RuntimeInstallEvent.STAGE,
+)
+
+enum class RuntimeInstallEvent { STAGE, COMMAND, OUTPUT, DOWNLOAD, COMMAND_COMPLETED, COMPLETED }
+
+private data class RuntimeBundle(
+    val label: String,
+    val fileName: String,
+    val sha256: String,
+    val compressedBytes: Long,
+)
+
+class RuntimeInstaller(private val context: Context) {
+    private val runtimeDir = File(context.filesDir, "runtime")
+    private val rootfs = File(runtimeDir, "ubuntu")
+    private val downloads = File(context.cacheDir, "runtime-downloads")
+    private val marker = File(rootfs, ".pocket-runtime-ready")
+    private val bundledClaudeMarker = File(rootfs, ".pocket-bundled-claude-version")
+    private val rootfsMarker = File(rootfs, ".pocket-rootfs-version")
+    private val languageToolsMarker = File(rootfs, ".pocket-language-tools-version")
+    private val coreToolsMarker = File(rootfs, ".pocket-core-tools-version")
+    private val systemUpgradeMarker = File(rootfs, ".pocket-system-upgrade-version")
+    private val devStacksFile = File(rootfs, ".pocket-dev-stacks.json")
+    private val macosMetadataRepairMarker = File(rootfs, ".pocket-macos-metadata-repair")
+
+    fun isInstalled(): Boolean {
+        val proot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+        // Devices set up before staged toolchains keep working through the legacy marker;
+        // fresh installs require the new core-tools marker instead.
+        val legacyLanguageTools = languageToolsMarker.readTextOrNull() == LANGUAGE_TOOLS_VERSION
+        val coreToolsReady = File(rootfs, "usr/bin/git").exists() &&
+            coreToolsMarker.readTextOrNull() == CORE_TOOLS_VERSION
+        val ready = proot.canExecute() &&
+            File(rootfs, "usr/bin/bash").exists() &&
+            rootfsMarker.readTextOrNull() == ROOTFS_VERSION &&
+            File(rootfs, "usr/local/bin/claude").exists() &&
+            File(rootfs, "usr/local/bin/node").exists() &&
+            (legacyLanguageTools || coreToolsReady) &&
+            marker.exists()
+        if (ready) repairLegacyMacosMetadata()
+        return ready
+    }
+
+    /**
+     * One-shot cleanup for devices that already extracted a tarball built on
+     * macOS without the `--no-mac-metadata` flag. Such bundles contain
+     * `._filename` AppleDouble metadata files that crash Python 3.8 when it
+     * reads every `.pth` file in site-packages. After the first successful
+     * cleanup we write a marker so we never walk the entire rootfs again.
+     */
+    private fun repairLegacyMacosMetadata() {
+        if (macosMetadataRepairMarker.isFile) return
+        if (!rootfs.isDirectory) return
+        stripMacosMetadataArtifacts(rootfs)
+        macosMetadataRepairMarker.parentFile?.mkdirs()
+        macosMetadataRepairMarker.writeText("1")
+    }
+
+    /** Returns the already verified runtime without performing network or update checks. */
+    fun installedRuntime(): InstalledRuntime {
+        check(isInstalled()) { "Claude Code setup is incomplete. Reopen Ash Forge to repair it." }
+        return InstalledRuntime(
+            proot = File(context.applicationInfo.nativeLibraryDir, "libproot.so"),
+            rootfs = rootfs,
+            claude = File(rootfs, "usr/local/bin/claude"),
+            version = marker.readText().trim(),
+        )
+    }
+
+    /** Removes only scaffolding written automatically by earlier PocketDev alpha builds. */
+    fun cleanupLegacyWorkspaceScaffolding() {
+        val workspaces = File(context.filesDir, "workspaces")
+        workspaces.listFiles { file -> file.isDirectory }.orEmpty().forEach { workspace ->
+            File(workspace, "README.md").deleteIfExact(LEGACY_README)
+            File(workspace, "index.html").deleteIfExact(LEGACY_INDEX)
+
+            listOf(
+                File(workspace, ".claude/settings.json"),
+                File(workspace, ".claude.json"),
+            ).forEach { settings ->
+                if (settings.isFile && settings.readTextOrNull()?.contains("/opt/pocket/permission-hook.sh") == true) {
+                    settings.delete()
+                }
+            }
+            File(workspace, ".claude").takeIf { it.isDirectory && it.list().isNullOrEmpty() }?.delete()
+        }
+    }
+
+    private fun File.deleteIfExact(expected: String) {
+        if (isFile && runCatching { readText() }.getOrNull() == expected) delete()
+    }
+
+    suspend fun ensureInstalled(
+        selectedStacks: Set<DevStack> = emptySet(),
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ): InstalledRuntime {
+        require(android.os.Build.SUPPORTED_ABIS.contains("arm64-v8a")) { "Ash Forge runtime requires an ARM64 device" }
+        val proot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+        require(proot.canExecute()) { "The embedded PRoot launcher is unavailable" }
+
+        if (!File(rootfs, "usr/bin/bash").exists() || rootfsMarker.readTextOrNull() != ROOTFS_VERSION) {
+            onProgress(RuntimeInstallProgress("Preparing the private development runtime", 0.03f))
+            val archive = obtainRuntimeBundle(
+                CORE_BUNDLE,
+                preferEmbedded = BuildConfig.OFFLINE_RUNTIME_BUNDLES,
+                from = 0.03f,
+                to = 0.25f,
+                onProgress,
+            )
+            onProgress(RuntimeInstallProgress("Verifying and unpacking the Core runtime", 0.28f))
+            val staging = File(runtimeDir, "ubuntu.installing")
+            staging.deleteRecursively()
+            staging.mkdirs()
+            extractZstdTar(archive, staging)
+            stripMacosMetadataArtifacts(staging)
+            require(File(staging, "usr/bin/bash").isFile) { "Core bundle is missing Bash" }
+            require(File(staging, "usr/local/bin/claude").isFile) { "Core bundle is missing Claude Code" }
+            rootfs.deleteRecursively()
+            check(staging.renameTo(rootfs)) { "Could not activate the Linux environment" }
+            writeResolver()
+            if (archive.parentFile == downloads) archive.delete()
+        }
+
+        val claude = File(rootfs, "usr/local/bin/claude")
+        check(claude.isFile) { "The Core runtime does not contain Claude Code" }
+        if (!marker.isFile) {
+            val bundledVersion = bundledClaudeMarker.readTextOrNull()
+            require(bundledVersion?.matches(CLAUDE_VERSION_PATTERN) == true) {
+                "The bundled Claude Code version is missing"
+            }
+            marker.writeText(bundledVersion)
+        }
+        ensureSettingsAndHooks()
+
+        if (hasInternetConnection()) {
+            onProgress(RuntimeInstallProgress("Checking the latest Claude Code release", 0.32f))
+            runCatching {
+                val latestVersion = fetchText("https://registry.npmjs.org/@anthropic-ai/claude-code/latest")
+                    .let { JSONObject(it).getString("version") }
+                    .also { require(it.matches(CLAUDE_VERSION_PATTERN)) }
+                if (marker.readText().trim() != latestVersion) {
+                    onProgress(RuntimeInstallProgress("Downloading Claude Code $latestVersion from Anthropic", 0.35f))
+                    val base = "https://downloads.claude.ai/claude-code-releases/$latestVersion"
+                    val manifest = JSONObject(fetchText("$base/manifest.json"))
+                    val checksum = manifest.getJSONObject("platforms").getJSONObject("linux-arm64").getString("checksum")
+                    val downloaded = File(downloads, "claude-$latestVersion")
+                    downloadVerified("$base/linux-arm64/claude", downloaded, checksum) { bytes, total ->
+                        val ratio = if (total > 0) bytes.toFloat() / total else 0f
+                        onProgress(RuntimeInstallProgress("Downloading Claude Code $latestVersion", 0.35f + ratio * 0.20f, bytes, total.takeIf { it > 0 }))
+                    }
+                    onProgress(RuntimeInstallProgress("Verifying Claude Code", 0.56f))
+                    claude.parentFile?.mkdirs()
+                    val staged = File(claude.parentFile, ".claude-$latestVersion.installing")
+                    downloaded.inputStream().use { input -> FileOutputStream(staged).use { input.copyTo(it) } }
+                    Os.chmod(staged.absolutePath, 0b111101101)
+                    Os.rename(staged.absolutePath, claude.absolutePath)
+                    downloaded.delete()
+                    marker.writeText(latestVersion)
+                }
+            }.onFailure {
+                onProgress(RuntimeInstallProgress("Using bundled Claude Code ${marker.readText().trim()}", 0.56f))
+            }
+        } else {
+            onProgress(RuntimeInstallProgress("Offline — using bundled Claude Code ${marker.readText().trim()}", 0.56f))
+        }
+
+        val version = marker.readText().trim()
+
+        // Node.js and Git are always available in the Core runtime. Python,
+        // C/C++, PHP, and Android remain opt-in stacks during onboarding.
+        val coreNeeded = !File(rootfs, "usr/bin/git").exists() ||
+            coreToolsMarker.readTextOrNull() != CORE_TOOLS_VERSION
+        if (coreNeeded) {
+            installNodeIfNeeded(proot, 0.58f, 0.66f, onProgress)
+        }
+        if (systemUpgradeMarker.readTextOrNull() != SYSTEM_UPGRADE_VERSION) {
+            runSystemMaintenance(proot, onProgress)
+            systemUpgradeMarker.writeText(SYSTEM_UPGRADE_VERSION)
+        }
+        if (coreNeeded) {
+            aptInstall(
+                proot,
+                listOf("git", "ca-certificates"),
+                "Installing Git and base tools",
+                0.70f,
+                onProgress,
+            )
+            writeResolver()
+            verifyGuest(proot, "git --version", "Base tools could not be verified")
+            coreToolsMarker.writeText(CORE_TOOLS_VERSION)
+        }
+
+        val missingStacks = selectedStacks.filterNot(::isStackInstalled)
+        missingStacks.forEachIndexed { index, stack ->
+            val slice = 0.26f / maxOf(1, missingStacks.size)
+            val from = 0.72f + index * slice
+            applyStack(proot, stack, from, from + slice, onProgress)
+        }
+
+        // The binary and version manifest were already checksum-verified above. Running a
+        // separate `claude --version` probe under PRoot can leave inherited output pipes
+        // open on some Android kernels, so the real user session is the launch check.
+        onProgress(RuntimeInstallProgress("Setup complete", 1f))
+        return InstalledRuntime(proot, rootfs, claude, version)
+    }
+
+    /**
+     * Installs one optional development stack inside Ubuntu. Safe to call again:
+     * already-installed stacks return immediately without network access.
+     */
+    suspend fun ensureStackInstalled(
+        stack: DevStack,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        val runtime = installedRuntime()
+        if (isStackInstalled(stack)) return
+        applyStack(runtime.proot, stack, 0.05f, 0.95f, onProgress)
+        onProgress(RuntimeInstallProgress("${stack.label} tools are ready", 1f))
+    }
+
+    private suspend fun applyStack(
+        proot: File,
+        stack: DevStack,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        var verified = true
+        when (stack) {
+            DevStack.WEB -> {
+                onProgress(RuntimeInstallProgress("Checking Node.js and npm", from))
+                verifyGuest(proot, "node --version && npm --version", "Node.js tools could not be verified")
+            }
+            DevStack.PYTHON -> {
+                installRuntimeOverlay(PYTHON_BUNDLE, "Installing Python, pip, and venv", from, to, onProgress)
+                runCatching {
+                    verifyGuest(proot, "python3 --version && pip3 --version", "Python tools could not be verified")
+                }.onFailure { error ->
+                    verified = false
+                    onProgress(
+                        RuntimeInstallProgress(
+                            "Python verify failed (will retry on next launch): ${error.message?.take(120)}",
+                            to,
+                        ),
+                    )
+                }
+            }
+            DevStack.ANDROID -> {
+                installAndroidToolchain(proot, from, to, onProgress)
+            }
+            DevStack.CPP -> {
+                aptInstall(
+                    proot,
+                    listOf("build-essential", "cmake", "gdb"),
+                    "Installing C/C++ compilers and build tools",
+                    from,
+                    onProgress,
+                )
+                verifyGuest(
+                    proot,
+                    "gcc --version && g++ --version && make --version && cmake --version",
+                    "C/C++ tools could not be verified",
+                )
+            }
+            DevStack.PHP -> {
+                aptInstall(
+                    proot,
+                    listOf("php-cli", "php-mbstring", "php-xml", "php-curl", "php-zip", "unzip"),
+                    "Installing PHP and common extensions",
+                    from,
+                    onProgress,
+                )
+                installComposer(proot, from, onProgress)
+                verifyGuest(proot, "php --version && composer --version", "PHP tools could not be verified")
+            }
+        }
+        if (!verified) return
+        writeDevStackState(readDevStackState().apply { put(stack.name, true) })
+        onProgress(RuntimeInstallProgress("${stack.label} installed", to))
+    }
+
+    /**
+     * Installs Composer into Ubuntu from the official latest-stable release,
+     * verified against getcomposer.org's published SHA-256 checksum.
+     */
+    private suspend fun installComposer(
+        proot: File,
+        fraction: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        val composer = File(rootfs, "usr/local/bin/composer")
+        if (composer.isFile) return
+        onProgress(RuntimeInstallProgress("Downloading Composer", fraction))
+        downloads.mkdirs()
+        val staged = File(downloads, "composer.phar")
+        val checksum = fetchText("https://getcomposer.org/download/latest-stable/composer.phar.sha256sum")
+            .lineSequence()
+            .firstOrNull()
+            ?.trim()
+            ?.substringBefore(' ')
+            ?.takeIf { it.matches(Regex("[0-9a-fA-F]{64}")) }
+            ?: error("Composer checksum was not found")
+        downloadVerified(
+            "https://getcomposer.org/download/latest-stable/composer.phar",
+            staged,
+            checksum,
+        ) { _, _ -> }
+        composer.parentFile?.mkdirs()
+        if (composer.exists()) composer.delete()
+        // cacheDir and filesDir can live on different mounts: copy instead of rename.
+        staged.inputStream().use { input -> FileOutputStream(composer).use { input.copyTo(it) } }
+        staged.delete()
+        Os.chmod(composer.absolutePath, 0b111101101)
+        onProgress(RuntimeInstallProgress("Installing Composer", fraction))
+    }
+
+    private suspend fun installAndroidToolchain(
+        proot: File,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        val marker = File(rootfs, "root/.pocket-android-tools-version")
+        val androidHome = File(rootfs, "root/android-sdk")
+        val gradleHome = File(rootfs, "opt/gradle")
+        val localMaven = File(rootfs, "root/maven/localMvnRepository")
+        if (marker.readTextOrNull() != ANDROID_TOOLS_VERSION ||
+            !File(androidHome, "platforms/android-36/android.jar").isFile ||
+            !File(androidHome, "build-tools/35.0.0/aapt2").isFile ||
+            !File(gradleHome, "gradle-8.14.3/bin/gradle").isFile ||
+            !localMaven.isDirectory) {
+            installRuntimeOverlay(
+                ANDROID_BUNDLE,
+                "Installing the Android development tools",
+                from,
+                to,
+                onProgress,
+            )
+            makeAndroidToolsExecutable(androidHome, gradleHome)
+            marker.parentFile?.mkdirs()
+            marker.writeText(ANDROID_TOOLS_VERSION)
+        }
+        // Keep this outside the download/install branch so app updates repair
+        // existing Android toolchains without downloading the bundles again.
+        writeAndroidGradleConfiguration(rootfs)
+
+        verifyGuest(
+            proot,
+            "java -version 2>&1 | grep -E '\"17\\.|version 17' && " +
+                "gradle --version && aapt2 version && test -f \"${'$'}ANDROID_HOME/platforms/android-36/android.jar\"",
+            "Android SDK, Gradle, or Java could not be verified",
+        )
+    }
+
+    private suspend fun installRuntimeOverlay(
+        bundle: RuntimeBundle,
+        message: String,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        // Always fetches the stack bundle from the release URL on demand
+        // (OFFLINE_RUNTIME_BUNDLES is a fixed constant, kept for anyone who
+        // later wires up a bundled build again — see docs/RELEASE_BUILD.md).
+        val archive = obtainRuntimeBundle(bundle, preferEmbedded = BuildConfig.OFFLINE_RUNTIME_BUNDLES, from, to * 0.8f + from * 0.2f, onProgress)
+        onProgress(RuntimeInstallProgress(message, to * 0.8f + from * 0.2f, indeterminate = true))
+        extractZstdTar(archive, rootfs)
+        stripMacosMetadataArtifacts(rootfs)
+        if (archive.parentFile == downloads) archive.delete()
+        onProgress(RuntimeInstallProgress("${bundle.label} tools installed", to))
+    }
+
+    /**
+     * Removes AppleDouble-style metadata files (`._*`) that some on-device
+     * tar builders and macOS tarballs embed alongside the real files. They
+     * are harmless to most tools, but Python's site module reads every
+     * `.pth` file in site-packages and crashes when one of them is a
+     * binary metadata blob.
+     */
+    private fun stripMacosMetadataArtifacts(root: File) {
+        if (!root.isDirectory) return
+        val queue = ArrayDeque<File>()
+        queue.add(root)
+        var removed = 0
+        while (queue.isNotEmpty()) {
+            val current = queue.removeFirst()
+            val children = current.listFiles() ?: continue
+            for (child in children) {
+                if (child.name.startsWith("._")) {
+                    if (child.isDirectory) child.deleteRecursively() else child.delete()
+                    removed++
+                } else if (child.isDirectory && !java.nio.file.Files.isSymbolicLink(child.toPath())) {
+                    queue.add(child)
+                }
+            }
+        }
+        if (removed > 0) {
+            android.util.Log.i("RuntimeInstaller", "Stripped $removed macOS metadata artifacts")
+        }
+    }
+
+    private suspend fun obtainRuntimeBundle(
+        bundle: RuntimeBundle,
+        preferEmbedded: Boolean,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ): File {
+        downloads.mkdirs()
+        val destination = File(downloads, bundle.fileName)
+        val useEmbedded = preferEmbedded || BuildConfig.OFFLINE_RUNTIME_BUNDLES
+        if (useEmbedded) {
+            onProgress(RuntimeInstallProgress("Loading ${bundle.label} bundle", from, 0, bundle.compressedBytes))
+            val temporary = File(downloads, "${bundle.fileName}.part")
+            context.assets.open("runtime/${bundle.fileName}").use { input ->
+                FileOutputStream(temporary).use { output ->
+                    val buffer = ByteArray(256 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        coroutineContext.ensureActive()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        copied += count
+                        val ratio = (copied.toFloat() / bundle.compressedBytes).coerceIn(0f, 1f)
+                        onProgress(RuntimeInstallProgress("Loading ${bundle.label} bundle", from + ratio * (to - from), copied, bundle.compressedBytes))
+                    }
+                }
+            }
+            require(digest(temporary, "SHA-256").equals(bundle.sha256, ignoreCase = true)) {
+                "${bundle.label} bundle checksum mismatch"
+            }
+            if (destination.exists()) destination.delete()
+            check(temporary.renameTo(destination)) { "Could not stage the ${bundle.label} bundle" }
+            return destination
+        }
+
+        val url = "${BuildConfig.RUNTIME_RELEASE_BASE_URL}/${bundle.fileName}"
+        downloadVerified(url, destination, bundle.sha256) { downloaded, total ->
+            val ratio = if (total > 0) downloaded.toFloat() / total else 0f
+            onProgress(RuntimeInstallProgress("Downloading ${bundle.label} bundle", from + ratio * (to - from), downloaded, total.takeIf { it > 0 }))
+        }
+        return destination
+    }
+
+    private suspend fun installZipAsset(
+        url: String,
+        checksum: String,
+        archiveName: String,
+        destination: File,
+        message: String,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        downloads.mkdirs()
+        val archive = File(downloads, archiveName)
+        downloadVerified(url, archive, checksum) { downloaded, total ->
+            val ratio = if (total > 0) downloaded.toFloat() / total else 0f
+            onProgress(RuntimeInstallProgress(message, from + ratio * (to - from), downloaded, total.takeIf { it > 0 }))
+        }
+        onProgress(RuntimeInstallProgress("Installing ${archiveName.removeSuffix(".zip")}", to, indeterminate = true))
+        val staging = File(destination.parentFile, "${destination.name}.installing")
+        staging.deleteRecursively()
+        staging.mkdirs()
+        extractZipArchive(archive, staging)
+        destination.deleteRecursively()
+        check(staging.renameTo(destination)) { "Could not activate ${destination.name}" }
+        archive.delete()
+    }
+
+    private fun extractZipArchive(archive: File, destination: File) {
+        ZipInputStream(BufferedInputStream(archive.inputStream())).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                val name = entry.name.removePrefix("./").trimStart('/')
+                if (name.isNotBlank()) {
+                    val target = safeChild(destination, name)
+                    if (entry.isDirectory) {
+                        target.mkdirs()
+                    } else {
+                        target.parentFile?.mkdirs()
+                        FileOutputStream(target).use { output -> zip.copyTo(output) }
+                    }
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+    }
+
+    private fun makeAndroidToolsExecutable(androidHome: File, gradleHome: File) {
+        val buildTools = File(androidHome, "build-tools/35.0.0")
+        listOf("aapt", "aapt2", "aidl", "apksigner", "d8", "dexdump", "split-select", "zipalign")
+            .map { File(buildTools, it) }
+            .plus(File(gradleHome, "gradle-8.14.3/bin/gradle"))
+            .filter(File::isFile)
+            .forEach { Os.chmod(it.absolutePath, 0b111101101) }
+    }
+
+    private fun writeAndroidGradleInitScript(runtimeRootfs: File) {
+        val script = File(runtimeRootfs, "root/.gradle/init.d/pocketdev-android.gradle")
+        script.parentFile?.mkdirs()
+        script.writeText(
+            """
+            def pocketMaven = uri('/root/maven/localMvnRepository')
+            beforeSettings { settings ->
+                settings.pluginManagement.repositories {
+                    maven { url = pocketMaven }
+                    google()
+                    mavenCentral()
+                    gradlePluginPortal()
+                }
+            }
+            settingsEvaluated { settings ->
+                settings.dependencyResolutionManagement.repositories {
+                    maven { url = pocketMaven }
+                }
+            }
+            gradle.beforeProject { project ->
+                project.extensions.extraProperties.set(
+                    'android.aapt2FromMavenOverride',
+                    '/root/android-sdk/build-tools/35.0.0/aapt2'
+                )
+                project.buildscript.repositories {
+                    maven { url = pocketMaven }
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+
+    @Synchronized
+    private fun writeAndroidGradleConfiguration(runtimeRootfs: File) {
+        val aapt2 = File(runtimeRootfs, ANDROID_AAPT2_HOST_PATH)
+        if (!aapt2.isFile) return
+
+        writeAndroidGradleInitScript(runtimeRootfs)
+        val gradleDir = File(runtimeRootfs, "root/.gradle").apply { mkdirs() }
+        val properties = File(gradleDir, "gradle.properties")
+        val propertyPattern = Regex("^\\s*${Regex.escape(ANDROID_AAPT2_PROPERTY)}\\s*[:=].*$")
+        val existingLines = properties.readTextOrNull()?.lineSequence()?.toList().orEmpty()
+        val expectedLine = "$ANDROID_AAPT2_PROPERTY=$ANDROID_AAPT2_GUEST_PATH"
+        val updatedLines = existingLines.filterNot { propertyPattern.matches(it) } + expectedLine
+        if (existingLines == updatedLines) return
+
+        val temporary = File(gradleDir, "gradle.properties.pocketdev.tmp")
+        temporary.writeText(updatedLines.joinToString("\n").trimEnd() + "\n")
+        Os.rename(temporary.absolutePath, properties.absolutePath)
+    }
+
+    /**
+     * One-time upgrade path from the old single-bundle layout: devices that already
+     * installed every tool keep all stacks without re-downloading anything.
+     */
+    fun migrateLegacyToolMarkers() {
+        if (!File(rootfs, "usr/bin/bash").isFile) return
+        if (languageToolsMarker.readTextOrNull() != LANGUAGE_TOOLS_VERSION) return
+        if (coreToolsMarker.readTextOrNull() != CORE_TOOLS_VERSION) coreToolsMarker.writeText(CORE_TOOLS_VERSION)
+        val state = readDevStackState()
+        DevStack.entries.forEach { stack -> if (!state.containsKey(stack.name)) state[stack.name] = true }
+        writeDevStackState(state)
+    }
+
+    fun installedStacks(): Set<DevStack> = readDevStackState()
+        .filterValues { it }
+        .keys
+        .mapNotNull { name -> runCatching { DevStack.valueOf(name) }.getOrNull() }
+        .filter(::isStackInstalled)
+        .toSet()
+
+    fun isStackInstalled(stack: DevStack): Boolean {
+        if (readDevStackState()[stack.name] != true) return false
+        if (stack != DevStack.ANDROID) return true
+        return File(rootfs, "root/.pocket-android-tools-version").readTextOrNull() == ANDROID_TOOLS_VERSION &&
+            File(rootfs, "root/android-sdk/platforms/android-36/android.jar").isFile &&
+            File(rootfs, "root/android-sdk/build-tools/35.0.0/aapt2").isFile &&
+            File(rootfs, "opt/gradle/gradle-8.14.3/bin/gradle").isFile &&
+            File(rootfs, "root/maven/localMvnRepository").let { it.isDirectory && !it.list().isNullOrEmpty() } &&
+            File(rootfs, "root/.gradle/init.d/pocketdev-android.gradle").isFile
+    }
+
+    private fun readDevStackState(): MutableMap<String, Boolean> {
+        if (!devStacksFile.isFile) return mutableMapOf()
+        return runCatching {
+            val obj = JSONObject(devStacksFile.readText())
+            mutableMapOf<String, Boolean>().apply {
+                DevStack.entries.forEach { stack ->
+                    if (obj.has(stack.name)) put(stack.name, obj.optBoolean(stack.name))
+                }
+            }
+        }.getOrDefault(mutableMapOf())
+    }
+
+    private fun writeDevStackState(state: Map<String, Boolean>) {
+        devStacksFile.parentFile?.mkdirs()
+        val obj = JSONObject()
+        state.forEach { (name, value) -> obj.put(name, value) }
+        devStacksFile.writeText(obj.toString())
+    }
+
+    private suspend fun installNodeIfNeeded(
+        proot: File,
+        from: Float,
+        to: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        if (File(rootfs, "usr/local/bin/node").exists()) return
+        onProgress(RuntimeInstallProgress("Downloading Node.js $NODE_VERSION LTS", from))
+        downloads.mkdirs()
+        val nodeFileName = "node-$NODE_VERSION-linux-arm64.tar.gz"
+        val nodeBaseUrl = "https://nodejs.org/dist/$NODE_VERSION"
+        val checksum = fetchText("$nodeBaseUrl/SHASUMS256.txt")
+            .lineSequence()
+            .map(String::trim)
+            .firstOrNull { it.endsWith("  $nodeFileName") }
+            ?.substringBefore(' ')
+            ?: error("Node.js checksum was not found")
+        val nodeArchive = File(downloads, nodeFileName)
+        downloadVerified("$nodeBaseUrl/$nodeFileName", nodeArchive, checksum) { downloaded, total ->
+            val ratio = if (total > 0) downloaded.toFloat() / total else 0f
+            onProgress(
+                RuntimeInstallProgress(
+                    "Downloading Node.js $NODE_VERSION LTS",
+                    from + ratio * (to - from),
+                    downloaded,
+                    total.takeIf { it > 0 },
+                ),
+            )
+        }
+        onProgress(RuntimeInstallProgress("Installing Node.js and npm", to))
+        val nodeStaging = File(runtimeDir, "node.installing")
+        nodeStaging.deleteRecursively()
+        nodeStaging.mkdirs()
+        extractNodeArchive(nodeArchive, nodeStaging)
+        val nodeHome = File(rootfs, "usr/local/lib/nodejs")
+        nodeHome.deleteRecursively()
+        nodeHome.parentFile?.mkdirs()
+        check(nodeStaging.renameTo(nodeHome)) { "Could not activate Node.js" }
+        val localBin = File(rootfs, "usr/local/bin").apply { mkdirs() }
+        listOf("node", "npm", "npx", "corepack").forEach { command ->
+            val link = File(localBin, command)
+            if (link.exists() || java.nio.file.Files.isSymbolicLink(link.toPath())) link.delete()
+            Os.symlink("../lib/nodejs/bin/$command", link.absolutePath)
+        }
+        nodeArchive.delete()
+    }
+
+    private suspend fun aptInstall(
+        proot: File,
+        packages: List<String>,
+        message: String,
+        fraction: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        onProgress(RuntimeInstallProgress(message, fraction))
+        aptInstallInternal(proot, packages, fraction, onProgress)
+    }
+
+    private suspend fun runSystemMaintenance(
+        proot: File,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        onProgress(
+            RuntimeInstallProgress(
+                message = "Updating the private Ubuntu environment",
+                fraction = 0.69f,
+                indeterminate = true,
+            ),
+        )
+        writeResolver()
+        val command = "export DEBIAN_FRONTEND=noninteractive; " +
+            "dpkg --configure -a && " +
+            "apt-get -o DPkg::Lock::Timeout=120 -f install -y && " +
+            "apt-get -o DPkg::Lock::Timeout=120 update && " +
+            "apt-get -o DPkg::Lock::Timeout=120 upgrade -y"
+        runGuestCommand(
+            proot = proot,
+            command = command,
+            displayCommand = "dpkg --configure -a && apt-get -f install -y && apt-get update && apt-get upgrade -y",
+            fraction = 0.69f,
+            timeoutMs = 35 * 60 * 1_000L,
+            onProgress = onProgress,
+            failureMessage = "Ubuntu maintenance could not be completed",
+        )
+    }
+
+    private suspend fun aptInstallInternal(
+        proot: File,
+        packages: List<String>,
+        fraction: Float,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+    ) {
+        require(packages.isNotEmpty()) { "No packages selected" }
+        writeResolver()
+        val packageNames = packages.joinToString(" ")
+        val command = "export DEBIAN_FRONTEND=noninteractive; " +
+            "dpkg --configure -a && " +
+            "apt-get -o DPkg::Lock::Timeout=120 -f install -y && " +
+            "apt-get -o DPkg::Lock::Timeout=120 update && " +
+            "apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends $packageNames && " +
+            "apt-get clean && rm -rf /var/lib/apt/lists/*"
+        runGuestCommand(
+            proot = proot,
+            command = command,
+            displayCommand = "dpkg --configure -a && apt-get -f install -y && apt-get install -y $packageNames",
+            fraction = fraction,
+            timeoutMs = 30 * 60 * 1_000L,
+            onProgress = onProgress,
+            failureMessage = "Could not install: $packageNames",
+        )
+    }
+
+    private suspend fun runGuestCommand(
+        proot: File,
+        command: String,
+        displayCommand: String,
+        fraction: Float,
+        timeoutMs: Long,
+        onProgress: suspend (RuntimeInstallProgress) -> Unit,
+        failureMessage: String,
+    ) {
+        onProgress(
+            RuntimeInstallProgress(
+                message = displayCommand,
+                fraction = fraction,
+                terminalLine = "root@pocket:~# $displayCommand",
+                indeterminate = true,
+                event = RuntimeInstallEvent.COMMAND,
+            ),
+        )
+        val running = process(
+            proot = proot,
+            rootfs = rootfs,
+            workspace = File(rootfs, "root"),
+            environment = emptyMap(),
+            guestCommand = listOf("/usr/bin/env", "bash", "-lc", command),
+        )
+        val native = running as? NativeSpawnProcess
+        val collected = StringBuilder()
+        try {
+            withTimeout(timeoutMs) {
+                var offset = 0L
+                var pending = ""
+                while (running.isAlive || (native?.outputFile?.length() ?: 0L) > offset) {
+                    coroutineContext.ensureActive()
+                    val file = native?.outputFile
+                    if (file != null && file.length() > offset) {
+                        RandomAccessFile(file, "r").use { input ->
+                            input.seek(offset)
+                            val available = (input.length() - offset).coerceAtMost(256 * 1024).toInt()
+                            val bytes = ByteArray(available)
+                            input.readFully(bytes)
+                            offset += available
+                            pending += bytes.toString(Charsets.UTF_8).replace('\r', '\n')
+                        }
+                        val parts = pending.split('\n')
+                        pending = parts.last()
+                        for (raw in parts.dropLast(1)) {
+                            val line = sanitizeTerminalLine(raw)
+                            if (line.isNotBlank()) {
+                                collected.appendLine(line)
+                                if (collected.length > MAX_COLLECTED_OUTPUT) collected.delete(0, collected.length - MAX_COLLECTED_OUTPUT)
+                                onProgress(
+                                    RuntimeInstallProgress(
+                                        message = line,
+                                        fraction = fraction,
+                                        terminalLine = line,
+                                        indeterminate = true,
+                                        event = RuntimeInstallEvent.OUTPUT,
+                                    ),
+                                )
+                            }
+                        }
+                    } else {
+                        delay(80)
+                    }
+                }
+                sanitizeTerminalLine(pending).takeIf(String::isNotBlank)?.let { line ->
+                    collected.appendLine(line)
+                    onProgress(RuntimeInstallProgress(line, fraction, terminalLine = line, indeterminate = true, event = RuntimeInstallEvent.OUTPUT))
+                }
+            }
+        } finally {
+            if (running.isAlive) running.destroy()
+        }
+        val exit = running.waitFor()
+        onProgress(
+            RuntimeInstallProgress(
+                message = if (exit == 0) "Command completed" else "Command failed (exit $exit)",
+                fraction = fraction,
+                terminalLine = "[exit $exit] $displayCommand",
+                event = RuntimeInstallEvent.COMMAND_COMPLETED,
+            ),
+        )
+        check(exit == 0) { collected.toString().trim().takeLast(1_000).ifBlank { failureMessage } }
+    }
+
+    private fun sanitizeTerminalLine(raw: String): String = raw
+        .replace(ANSI_ESCAPE, "")
+        .filter { it == '\t' || it.code >= 32 }
+        .take(MAX_TERMINAL_LINE)
+
+    private suspend fun verifyGuest(proot: File, command: String, failureMessage: String) {
+        val verify = process(
+            proot = proot,
+            rootfs = rootfs,
+            workspace = File(rootfs, "root"),
+            environment = emptyMap(),
+            guestCommand = listOf("/usr/bin/env", "bash", "-lc", command),
+        )
+        withTimeout(60_000L) {
+            while (verify.isAlive) delay(50)
+        }
+        val exit = verify.waitFor()
+        val output = (verify as? NativeSpawnProcess)?.outputFile
+            ?.let(::readProcessOutputSafely)
+            .orEmpty()
+            .trim()
+        check(exit == 0) { output.ifBlank { failureMessage } }
+    }
+
+    /**
+     * Reads a captured PRoot process output file as UTF-8 with replacement,
+     * so a stray non-UTF-8 byte in the bundled runtime (for example a binary
+     * .pth file from a tarball built on a non-UTF-8 filesystem) does not
+     * abort setup.
+     */
+    private fun readProcessOutputSafely(file: File): String = runCatching {
+        val decoder = java.nio.charset.StandardCharsets.UTF_8
+            .newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPLACE)
+        val bytes = file.readBytes()
+        val buffer = java.nio.ByteBuffer.wrap(bytes)
+        decoder.decode(buffer).toString()
+    }.getOrElse { error ->
+        android.util.Log.w("RuntimeInstaller", "Could not decode process output as UTF-8: ${error.message}")
+        ""
+    }
+
+    suspend fun initializeExisting(onProgress: suspend (RuntimeInstallProgress) -> Unit): InstalledRuntime {
+        val installed = installedRuntime()
+        val proot = installed.proot
+        val claude = installed.claude
+        val version = installed.version
+        onProgress(RuntimeInstallProgress("Checking private runtime files", 0.15f))
+        writeResolver()
+        ensureSettingsAndHooks()
+        File(context.filesDir, "runtime-bridge").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
+        onProgress(RuntimeInstallProgress("Preparing the Android runtime bridge", 0.42f))
+        val probe = process(proot, rootfs, File(rootfs, "root"), emptyMap(), listOf("/usr/local/bin/claude", "--version"))
+        onProgress(RuntimeInstallProgress("Starting Claude Code $version", 0.68f))
+        withTimeout(20_000) {
+            while (probe.isAlive) delay(50)
+        }
+        val exit = probe.waitFor()
+        val output = (probe as? NativeSpawnProcess)?.outputFile?.readText().orEmpty().trim()
+        check(exit == 0) { output.ifBlank { "Claude Code initialization failed (exit $exit)" } }
+        onProgress(RuntimeInstallProgress("Claude Code is ready", 1f))
+        return installed
+    }
+
+    fun process(
+        proot: File,
+        rootfs: File,
+        workspace: File,
+        environment: Map<String, String>,
+        guestCommand: List<String>,
+        guestWorkspacePath: String = "/workspace",
+    ): Process {
+        require(
+            guestWorkspacePath == "/workspace" ||
+                Regex("^/workspace/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$").matches(guestWorkspacePath),
+        ) { "Invalid project workspace path" }
+        workspace.mkdirs()
+        File(rootfs, guestWorkspacePath.removePrefix("/")).mkdirs()
+        // Self-heal devices whose Android tools were installed by an older app
+        // version before the global AAPT2 override was persisted.
+        writeAndroidGradleConfiguration(rootfs)
+        ensureWorkspaceTrust(guestWorkspacePath)
+        val bridge = File(context.filesDir, "runtime-bridge").apply { mkdirs() }
+        val args = buildList {
+            add(proot.absolutePath)
+            add("--link2symlink")
+            add("-0")
+            add("-r")
+            add(rootfs.absolutePath)
+            add("-b")
+            add("/dev")
+            add("-b")
+            add("/proc")
+            add("-b")
+            add("/sys")
+            // ARM64 Android build tools (notably aapt2) use Bionic's
+            // /system/bin/linker64 and, on newer releases, APEX libraries.
+            listOf("/system", "/apex", "/vendor", "/product").forEach { hostPath ->
+                if (File(hostPath).exists()) {
+                    File(rootfs, hostPath.removePrefix("/")).mkdirs()
+                    add("-b")
+                    add(hostPath)
+                }
+            }
+            add("-b")
+            add("${workspace.absolutePath}:$guestWorkspacePath")
+            add("-b")
+            add("${bridge.absolutePath}:/pocket-bridge")
+            add("-w")
+            add(guestWorkspacePath)
+            addAll(guestCommand)
+        }
+        val prootTemp = File(context.cacheDir, "proot-tmp").apply { mkdirs() }
+        return NativeSpawnProcess.start(
+            argv = args,
+            environment = buildMap {
+                put("HOME", "/root")
+                val androidReady = File(rootfs, "root/.pocket-android-tools-version").readTextOrNull() == ANDROID_TOOLS_VERSION
+                val basePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                if (androidReady) {
+                    put("ANDROID_HOME", "/root/android-sdk")
+                    put("ANDROID_SDK_ROOT", "/root/android-sdk")
+                    put("GRADLE_HOME", "/opt/gradle/gradle-8.14.3")
+                    put("GRADLE_USER_HOME", "/root/.gradle")
+                    put("ORG_GRADLE_PROJECT_android.aapt2FromMavenOverride", "/root/android-sdk/build-tools/35.0.0/aapt2")
+                    put("PATH", "/opt/gradle/gradle-8.14.3/bin:/root/android-sdk/build-tools/35.0.0:/root/android-sdk/cmdline-tools/latest/bin:$basePath")
+                } else {
+                    put("PATH", basePath)
+                }
+                put("LANG", "C.UTF-8")
+                put("TERM", "xterm-256color")
+                put("LD_LIBRARY_PATH", context.applicationInfo.nativeLibraryDir)
+                put("PROOT_NO_SECCOMP", "1")
+                put("PROOT_TMP_DIR", prootTemp.absolutePath)
+                put("PROOT_LOADER", File(context.applicationInfo.nativeLibraryDir, "libprootloader.so").absolutePath)
+                // Also protects any glibc helper Claude starts later.
+                put("GLIBC_TUNABLES", "glibc.pthread.rseq=0")
+                putAll(environment)
+            },
+            cwd = context.filesDir.absolutePath,
+            outputFile = File(context.cacheDir, "runtime-output-${System.nanoTime()}.log"),
+        )
+    }
+
+    fun ensureSettingsAndHooks() {
+        val hook = File(rootfs, "opt/pocket/permission-hook.sh")
+        hook.parentFile?.mkdirs()
+        hook.writeText(
+            """#!/bin/sh
+cat > /dev/null
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
+""",
+        )
+        Os.chmod(hook.absolutePath, 0b111101101)
+
+        val settingsContent = JSONObject()
+            .put("disableAllHooks", false)
+            .put(
+                "permissions",
+                JSONObject()
+                    .put("allow", claudeWorkspaceToolRules())
+                    .put("defaultMode", "acceptEdits"),
+            )
+            .put(
+                "hooks",
+                JSONObject().put(
+                    "PermissionRequest",
+                    org.json.JSONArray().put(
+                        JSONObject()
+                            .put("matcher", "Bash|Edit|Write|NotebookEdit")
+                            .put(
+                                "hooks",
+                                org.json.JSONArray().put(
+                                    JSONObject().put("type", "command").put("command", "/opt/pocket/permission-hook.sh"),
+                                ),
+                            ),
+                    ),
+                ),
+            )
+            .toString()
+
+        val settingsPaths = listOf(
+            File(rootfs, "root/.claude/pocket-settings.json"),
+            File(rootfs, "root/.claude/settings.json"),
+            File(rootfs, "etc/claude/settings.json"),
+        )
+        for (target in settingsPaths) {
+            target.parentFile?.mkdirs()
+            target.writeText(settingsContent)
+        }
+        ensureWorkspaceTrust("/workspace")
+    }
+
+    private fun ensureWorkspaceTrust(workspacePath: String) {
+        val stateFile = File(rootfs, "root/.claude.json")
+        val state = runCatching { JSONObject(stateFile.readText()) }.getOrElse { JSONObject() }
+        // Older alpha builds incorrectly wrote settings into Claude's state file.
+        // Keep Claude's generated state, but remove only those stale settings keys.
+        listOf("disableAllHooks", "permissions", "hooks", "allowedTools", "autoApprove")
+            .forEach(state::remove)
+        val projects = state.optJSONObject("projects") ?: JSONObject()
+        val workspace = projects.optJSONObject(workspacePath) ?: JSONObject()
+        workspace.put("hasTrustDialogAccepted", true)
+        projects.put(workspacePath, workspace)
+        state.put("projects", projects)
+        stateFile.writeText(state.toString())
+    }
+
+    private fun claudeWorkspaceToolRules() = org.json.JSONArray().apply {
+        put("Bash")
+        put("Edit")
+        put("Write")
+        put("NotebookEdit")
+        put("Read")
+        put("Glob")
+        put("Grep")
+    }
+
+    private fun writeResolver() {
+        val manager = context.getSystemService(ConnectivityManager::class.java)
+        val dns = manager.getLinkProperties(manager.activeNetwork)?.dnsServers.orEmpty()
+        val servers = dns.mapNotNull { it.hostAddress }.ifEmpty { listOf("8.8.8.8", "1.1.1.1") }
+        File(rootfs, "etc/resolv.conf").writeText(servers.joinToString("\n") { "nameserver $it" } + "\n")
+    }
+
+    private fun hasInternetConnection(): Boolean {
+        val manager = context.getSystemService(ConnectivityManager::class.java)
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun extractRootfs(archive: File, destination: File) {
+        val deferredLinks = mutableListOf<Pair<File, File>>()
+        TarArchiveInputStream(GzipCompressorInputStream(BufferedInputStream(archive.inputStream()))).use { tar ->
+            var entry: TarArchiveEntry? = tar.nextEntry
+            while (entry != null) {
+                val cleanName = entry.name.removePrefix("./")
+                val target = safeChild(destination, cleanName)
+                when {
+                    entry.isDirectory -> target.mkdirs()
+                    entry.isSymbolicLink -> {
+                        target.parentFile?.mkdirs()
+                        if (target.exists() || java.nio.file.Files.isSymbolicLink(target.toPath())) target.delete()
+                        Os.symlink(entry.linkName, target.absolutePath)
+                    }
+                    entry.isLink -> {
+                        target.parentFile?.mkdirs()
+                        val linkTarget = safeChild(destination, entry.linkName.removePrefix("./"))
+                        if (linkTarget.exists()) {
+                            linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+                        } else {
+                            deferredLinks += target to linkTarget
+                        }
+                    }
+                    entry.isFile -> {
+                        target.parentFile?.mkdirs()
+                        FileOutputStream(target).use { output -> tar.copyTo(output) }
+                        runCatching { Os.chmod(target.absolutePath, entry.mode and 0b111111111) }
+                    }
+                }
+                entry = tar.nextEntry
+            }
+        }
+        deferredLinks.forEach { (target, linkTarget) ->
+            require(linkTarget.isFile) { "Archive hard-link target is missing" }
+            target.parentFile?.mkdirs()
+            linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+            runCatching { Os.chmod(target.absolutePath, android.system.Os.stat(linkTarget.absolutePath).st_mode) }
+        }
+    }
+
+    private fun extractZstdTar(archive: File, destination: File) {
+        val deferredLinks = mutableListOf<Pair<File, File>>()
+        TarArchiveInputStream(
+            ZstdCompressorInputStream(BufferedInputStream(archive.inputStream())),
+        ).use { tar ->
+            var entry: TarArchiveEntry? = tar.nextEntry
+            while (entry != null) {
+                val cleanName = entry.name.removePrefix("./")
+                if (cleanName.isNotBlank()) {
+                    val target = safeChild(destination, cleanName)
+                    when {
+                        entry.isDirectory -> target.mkdirs()
+                        entry.isSymbolicLink -> {
+                            target.parentFile?.mkdirs()
+                            if (target.exists() || java.nio.file.Files.isSymbolicLink(target.toPath())) target.delete()
+                            Os.symlink(entry.linkName, target.absolutePath)
+                        }
+                        entry.isLink -> {
+                            target.parentFile?.mkdirs()
+                            val linkTarget = safeChild(destination, entry.linkName.removePrefix("./"))
+                            if (linkTarget.exists()) {
+                                linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+                            } else {
+                                deferredLinks += target to linkTarget
+                            }
+                        }
+                        entry.isFile -> {
+                            target.parentFile?.mkdirs()
+                            FileOutputStream(target).use { output -> tar.copyTo(output) }
+                            runCatching { Os.chmod(target.absolutePath, entry.mode and 0b111111111) }
+                        }
+                    }
+                }
+                entry = tar.nextEntry
+            }
+        }
+        deferredLinks.forEach { (target, linkTarget) ->
+            require(linkTarget.isFile) { "Archive hard-link target is missing" }
+            target.parentFile?.mkdirs()
+            linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+            runCatching { Os.chmod(target.absolutePath, android.system.Os.stat(linkTarget.absolutePath).st_mode) }
+        }
+    }
+
+    private fun extractNodeArchive(archive: File, destination: File) {
+        val deferredLinks = mutableListOf<Pair<File, File>>()
+        TarArchiveInputStream(GzipCompressorInputStream(BufferedInputStream(archive.inputStream()))).use { tar ->
+            var entry: TarArchiveEntry? = tar.nextEntry
+            while (entry != null) {
+                val relative = entry.name.removePrefix("./").substringAfter('/', "")
+                if (relative.isNotBlank()) {
+                    val target = safeChild(destination, relative)
+                    when {
+                        entry.isDirectory -> target.mkdirs()
+                        entry.isSymbolicLink -> {
+                            target.parentFile?.mkdirs()
+                            if (target.exists() || java.nio.file.Files.isSymbolicLink(target.toPath())) target.delete()
+                            Os.symlink(entry.linkName, target.absolutePath)
+                        }
+                        entry.isLink -> {
+                            val relativeLink = entry.linkName.removePrefix("./").substringAfter('/', "")
+                            val linkTarget = safeChild(destination, relativeLink)
+                            target.parentFile?.mkdirs()
+                            if (linkTarget.exists()) {
+                                linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+                            } else {
+                                deferredLinks += target to linkTarget
+                            }
+                        }
+                        entry.isFile -> {
+                            target.parentFile?.mkdirs()
+                            FileOutputStream(target).use { output -> tar.copyTo(output) }
+                            runCatching { Os.chmod(target.absolutePath, entry.mode and 0b111111111) }
+                        }
+                    }
+                }
+                entry = tar.nextEntry
+            }
+        }
+        deferredLinks.forEach { (target, linkTarget) ->
+            require(linkTarget.isFile) { "Node.js archive hard-link target is missing" }
+            target.parentFile?.mkdirs()
+            linkTarget.inputStream().use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+            runCatching { Os.chmod(target.absolutePath, android.system.Os.stat(linkTarget.absolutePath).st_mode) }
+        }
+    }
+
+    private fun safeChild(root: File, relative: String): File {
+        require(relative.isNotBlank() && !relative.startsWith('/')) { "Unsafe archive path" }
+        val file = File(root, relative)
+        val rootPath = root.canonicalFile.toPath()
+        val parentPath = (file.parentFile ?: root).canonicalFile.toPath()
+        require(parentPath.startsWith(rootPath)) { "Archive path escapes runtime" }
+        return file
+    }
+
+    private suspend fun downloadVerified(
+        url: String,
+        destination: File,
+        expectedChecksum: String,
+        algorithm: String = "SHA-256",
+        onBytes: suspend (downloaded: Long, total: Long) -> Unit,
+    ) {
+        destination.parentFile?.mkdirs()
+        if (destination.isFile && digest(destination, algorithm).equals(expectedChecksum, ignoreCase = true)) {
+            onBytes(destination.length(), destination.length())
+            return
+        }
+        val temporary = File(destination.parentFile, "${destination.name}.part")
+        var existing = temporary.takeIf(File::isFile)?.length() ?: 0L
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 20_000
+        connection.readTimeout = 120_000
+        connection.instanceFollowRedirects = true
+        if (existing > 0L) connection.setRequestProperty("Range", "bytes=$existing-")
+        check(connection.responseCode in 200..299) { "Download failed with HTTP ${connection.responseCode}" }
+        val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existing > 0L
+        if (!resumed) {
+            temporary.delete()
+            existing = 0L
+        }
+        val total = connection.contentLengthLong.takeIf { it >= 0L }?.plus(existing) ?: -1L
+        connection.inputStream.use { input ->
+            FileOutputStream(temporary, resumed).use { output ->
+                val buffer = ByteArray(128 * 1024)
+                var downloaded = existing
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    downloaded += count
+                    onBytes(downloaded, total)
+                }
+            }
+        }
+        connection.disconnect()
+        val actual = digest(temporary, algorithm)
+        if (!actual.equals(expectedChecksum, ignoreCase = true)) {
+            temporary.delete()
+            error("Downloaded file checksum did not match")
+        }
+        destination.delete()
+        check(temporary.renameTo(destination)) { "Could not finish download" }
+    }
+
+    private fun fetchText(url: String): String {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 30_000
+        connection.setRequestProperty("Accept", "application/json")
+        check(connection.responseCode in 200..299) { "Request failed with HTTP ${connection.responseCode}" }
+        return connection.inputStream.bufferedReader().use { it.readText() }.also { connection.disconnect() }
+    }
+
+    private fun digest(file: File, algorithm: String): String {
+        val digest = MessageDigest.getInstance(algorithm)
+        file.inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun File.readTextOrNull(): String? = runCatching { readText().trim() }.getOrNull()
+
+    companion object {
+        private const val LEGACY_README = "# Ash Forge project\n\nThis project is managed locally on Android.\n"
+        private const val LEGACY_INDEX = "<!doctype html><title>Ash Forge</title><h1>Hello from Android</h1>\n"
+        private const val ROOTFS_VERSION = "ubuntu-20.04.5-arm64"
+        private const val ROOTFS_FILE = "ubuntu-base-20.04.5-base-arm64.tar.gz"
+        private const val ROOTFS_URL = "https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/$ROOTFS_FILE"
+        private const val ROOTFS_SHA256 = "f9b999afb4c4b10193087ea8c11be36d688f19e609b05179b571f29357954b52"
+        private const val NODE_VERSION = "v24.19.0"
+        private const val LANGUAGE_TOOLS_VERSION = "node-v24.19.0-python3-v1"
+        private const val CORE_TOOLS_VERSION = "core-bundle-2026.09.4"
+        private const val SYSTEM_UPGRADE_VERSION = "ubuntu-maintenance-v1"
+        private const val ANDROID_TOOLS_VERSION = "sdk36-build-tools35-gradle8.14.3-maven-2026.09"
+        private const val ANDROID_ASSET_BASE = "https://appdevforall.org/dev-assets/debug"
+        private const val ANDROID_SDK_URL = "$ANDROID_ASSET_BASE/android-sdk-arm64-v8a.zip"
+        private const val ANDROID_SDK_SHA256 = "bfe5bc940a7ede14735817a40962256666ce4152b9f3135f34a4ab9bccb87c3f"
+        private const val ANDROID_GRADLE_URL = "$ANDROID_ASSET_BASE/gradle-8.14.3-bin.zip"
+        private const val ANDROID_GRADLE_SHA256 = "8e228b640319a7c739c0a93d002facdeb08e8f3ba394d57d74ee355a5e93072c"
+        private const val ANDROID_MAVEN_URL = "$ANDROID_ASSET_BASE/localMvnRepository.zip"
+        private const val ANDROID_MAVEN_SHA256 = "3ba89892b43377d60743568d1b9004f172c2eab75dac059064f82dec497819f9"
+        private const val ANDROID_AAPT2_PROPERTY = "android.aapt2FromMavenOverride"
+        private const val ANDROID_AAPT2_GUEST_PATH = "/root/android-sdk/build-tools/35.0.0/aapt2"
+        private const val ANDROID_AAPT2_HOST_PATH = "root/android-sdk/build-tools/35.0.0/aapt2"
+        private val CLAUDE_VERSION_PATTERN = Regex("[0-9]+\\.[0-9]+\\.[0-9]+")
+        private val CORE_BUNDLE = RuntimeBundle(
+            label = "Core",
+            fileName = "pocketdev-core-arm64-2026.09.4.tar.zst",
+            sha256 = "6b60d21c3441fe0b127baadded253371fa585525e60871fb814ca29b4fed0de0",
+            compressedBytes = 148_844_879L,
+        )
+        private val PYTHON_BUNDLE = RuntimeBundle(
+            label = "Python",
+            fileName = "pocketdev-python-arm64-2026.09.2.tar.zst",
+            sha256 = "6b3f56f7743fec142bc045db3ea561ee83fe89af87c2799165ef60351164ef85",
+            compressedBytes = 55_419_626L,
+        )
+        private val ANDROID_BUNDLE = RuntimeBundle(
+            label = "Android",
+            fileName = "pocketdev-android-arm64-2026.09.1.tar.zst",
+            sha256 = "01bea058ebcb17416d1eb08c0211b3782da3228eb3c8348eb3719f2d61dd3ec6",
+            compressedBytes = 569_652_007L,
+        )
+        private const val MAX_TERMINAL_LINE = 500
+        private const val MAX_COLLECTED_OUTPUT = 24_000
+        private val ANSI_ESCAPE = Regex("\\u001B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\u0007]*(?:\\u0007|\\u001B\\\\))")
+    }
+}
