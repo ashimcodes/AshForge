@@ -9,21 +9,24 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONObject
 
 /**
  * Loopback-only reverse proxy between Claude Code and OpenCode Zen's free tier
  * (https://opencode.ai/zen). Zen already speaks the Anthropic Messages format
- * Claude Code sends, so nothing here translates the request — the only job is
- * attaching the identity Zen's gateway expects from its own official clients:
- * a matching User-Agent/client header, and a stable per-conversation session
- * header the gateway uses to group a conversation's requests together.
+ * Claude Code sends, so nothing here translates the request — its two jobs are:
  *
- * Without these, Zen's completions endpoint intermittently rejects otherwise
- * valid "public"-credential requests with a plain HTTP 500, even though the
- * same credential works fine for listing models (which needs no session
- * header). The header names/values below match what OpenCode's own desktop
- * client sends — not a secret or a bypassed credential, just matching the
- * shape of a request their own client already sends for this exact free tier.
+ * 1. Attaching the identity Zen's gateway expects from its own official clients
+ *    (a matching User-Agent/client header, and a stable per-conversation session
+ *    header the gateway uses to group a conversation's requests). Without these,
+ *    completions can 500 even with a valid credential, though listing models
+ *    doesn't need it.
+ *
+ * 2. Falling back to another free model when the requested one fails. Zen's free
+ *    tier is shared, best-effort capacity — individual models go down or 500
+ *    intermittently. OpenCode's own client silently retries a failed request on
+ *    a different model rather than surfacing the error; this does the same, so
+ *    a single flaky model doesn't block the whole session.
  */
 internal class OpenCodeZenProxy(
     private val upstreamBaseUrl: String,
@@ -66,44 +69,83 @@ internal class OpenCodeZenProxy(
             offset += count
         }
         val output = BufferedOutputStream(socket.getOutputStream())
-        runCatching {
-            val connection = URL(upstreamBaseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
-            connection.requestMethod = method
-            connection.connectTimeout = 20_000
-            connection.readTimeout = 180_000
-            // Carry over what Claude Code sent (auth, content-type, anthropic-version, its
-            // own request-id) — everything except hop-by-hop headers and the identity ones
-            // we're about to override below.
-            headers.forEach { (key, value) ->
-                if (key !in setOf("host", "content-length", "connection", "user-agent")) {
-                    runCatching { connection.setRequestProperty(key, value) }
+
+        // Candidate models to try, in order, for this specific request. Only completion
+        // requests (a JSON body with a "model" field) get fallback candidates; everything
+        // else (e.g. GET /v1/models) is a single attempt with its body untouched.
+        val requestedModel = runCatching {
+            if (length > 0) JSONObject(bodyBytes.decodeToString()).optString("model").takeIf { it.isNotBlank() } else null
+        }.getOrNull()
+        val candidates = if (requestedModel != null) {
+            listOf(requestedModel) + FALLBACK_MODELS.filterNot { it == requestedModel }
+        } else {
+            listOf<String?>(null)
+        }
+
+        var lastCode = 502
+        var lastBytes = ByteArray(0)
+        var lastContentType = "application/json"
+        var succeeded = false
+
+        for (model in candidates) {
+            if (succeeded) break
+            val attemptBody = if (model != null && model != requestedModel) {
+                runCatching {
+                    JSONObject(bodyBytes.decodeToString()).put("model", model).toString().toByteArray()
+                }.getOrDefault(bodyBytes)
+            } else {
+                bodyBytes
+            }
+            runCatching {
+                val connection = URL(upstreamBaseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
+                connection.requestMethod = method
+                connection.connectTimeout = 20_000
+                connection.readTimeout = 180_000
+                // Carry over what Claude Code sent (auth, content-type, anthropic-version, its
+                // own request-id) — everything except hop-by-hop headers and the identity ones
+                // we're about to override below.
+                headers.forEach { (key, value) ->
+                    if (key !in setOf("host", "content-length", "connection", "user-agent")) {
+                        runCatching { connection.setRequestProperty(key, value) }
+                    }
                 }
+                connection.setRequestProperty("User-Agent", "opencode/latest/1.18.15/desktop")
+                connection.setRequestProperty("x-opencode-client", "desktop")
+                connection.setRequestProperty("x-opencode-session", sessionId)
+                if (attemptBody.isNotEmpty()) {
+                    connection.doOutput = true
+                    connection.outputStream.use { it.write(attemptBody) }
+                }
+                val code = connection.responseCode
+                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                val responseBytes = stream?.readBytes() ?: ByteArray(0)
+                val contentType = connection.contentType ?: "application/json"
+                connection.disconnect()
+                lastCode = code
+                lastBytes = responseBytes
+                lastContentType = contentType
+                if (code in 200..299) {
+                    succeeded = true
+                } else if (code in 500..599 && model != candidates.last()) {
+                    Log.w("OpenCodeZenProxy", "Model '$model' returned $code, trying next fallback")
+                } else {
+                    succeeded = true // Not a 5xx (e.g. 400/401) — retrying a different model won't help.
+                }
+            }.onFailure { error ->
+                Log.w("OpenCodeZenProxy", "Upstream request failed for model '$model': ${error.message}")
+                lastCode = 502
+                val message = (error.message ?: "Proxy request failed").replace("\"", "'")
+                lastBytes = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"$message\"}}".toByteArray()
+                lastContentType = "application/json"
             }
-            connection.setRequestProperty("User-Agent", "opencode/latest/1.18.15/desktop")
-            connection.setRequestProperty("x-opencode-client", "desktop")
-            connection.setRequestProperty("x-opencode-session", sessionId)
-            if (length > 0) {
-                connection.doOutput = true
-                connection.outputStream.use { it.write(bodyBytes) }
-            }
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val responseBytes = stream?.readBytes() ?: ByteArray(0)
-            val contentType = connection.contentType ?: "application/json"
-            connection.disconnect()
-            output.write("HTTP/1.1 $code ${if (code in 200..299) "OK" else "Error"}\r\n".toByteArray())
-            output.write("Content-Type: $contentType\r\n".toByteArray())
-            output.write("Content-Length: ${responseBytes.size}\r\n".toByteArray())
+        }
+
+        runCatching {
+            output.write("HTTP/1.1 $lastCode ${if (lastCode in 200..299) "OK" else "Error"}\r\n".toByteArray())
+            output.write("Content-Type: $lastContentType\r\n".toByteArray())
+            output.write("Content-Length: ${lastBytes.size}\r\n".toByteArray())
             output.write("Connection: close\r\n\r\n".toByteArray())
-            output.write(responseBytes)
-            output.flush()
-        }.onFailure { error ->
-            Log.w("OpenCodeZenProxy", "Upstream request failed: ${error.message}")
-            val message = (error.message ?: "Proxy request failed").replace("\"", "'")
-            val body = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"$message\"}}"
-            val bytes = body.toByteArray()
-            output.write("HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
-            output.write(bytes)
+            output.write(lastBytes)
             output.flush()
         }
     }
@@ -122,4 +164,19 @@ internal class OpenCodeZenProxy(
         running.set(false)
         runCatching { server.close() }
     }
+
+    companion object {
+        // Tried in order after whatever model was originally requested. Kept short and
+        // deliberately diverse (different underlying model families) so one provider's
+        // outage doesn't take out every candidate at once.
+        private val FALLBACK_MODELS = listOf(
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+            "minimax-m2.5-free",
+            "nemotron-3-super-free",
+            "big-pickle",
+        )
+    }
 }
+
+
