@@ -26,6 +26,17 @@ class ProviderApiClient {
     // session header for the setup-time connection check below.
     private val zenSetupSessionId = "setup_${UUID.randomUUID()}"
 
+    companion object {
+        // Kept in sync with OpenCodeZenProxy.FALLBACK_MODELS.
+        private val ZEN_FALLBACK_MODELS = listOf(
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+            "minimax-m2.5-free",
+            "nemotron-3-super-free",
+            "big-pickle",
+        )
+    }
+
     suspend fun discoverModels(
         baseUrl: String,
         apiKey: String,
@@ -64,11 +75,25 @@ class ProviderApiClient {
             return@withContext ConnectionValidation.Failure("Base URL, model, and API key are required.")
         }
         val endpoint = messagesEndpoint(baseUrl, protocol)
-        val body = validationBody(model, protocol)
-        val response = request(endpoint, "POST", apiKey, body, protocol, connectTimeoutMs = 8_000, readTimeoutMs = 10_000)
+        // OpenCode Zen's free tier is shared, best-effort capacity — a single model can 500
+        // even though the gateway itself is fine. Mirror what OpenCode's own client does:
+        // try a couple of alternates before reporting a failure, so one flaky model doesn't
+        // block setup. Every other provider still gets exactly one attempt, unchanged.
+        val isZen = runCatching { URL(endpoint).host == "opencode.ai" }.getOrDefault(false)
+        val candidates = if (isZen) listOf(model) + ZEN_FALLBACK_MODELS.filterNot { it == model } else listOf(model)
+        var response = HttpResult(0, "", null)
+        var usedModel = model
+        for (candidate in candidates) {
+            val body = validationBody(candidate, protocol)
+            response = request(endpoint, "POST", apiKey, body, protocol, connectTimeoutMs = 8_000, readTimeoutMs = 10_000)
+            usedModel = candidate
+            if (response.code !in 500..599) break
+        }
         when {
             response.code in 200..299 -> ConnectionValidation.Success(
-                if (protocol == ProviderProtocol.ANTHROPIC || protocol == ProviderProtocol.ANTHROPIC_GATEWAY || protocol == ProviderProtocol.OPENROUTER) {
+                if (usedModel != model) {
+                    "Connected using '$usedModel' \u2014 '$model' was temporarily unavailable."
+                } else if (protocol == ProviderProtocol.ANTHROPIC || protocol == ProviderProtocol.ANTHROPIC_GATEWAY || protocol == ProviderProtocol.OPENROUTER) {
                     "Anthropic Messages endpoint verified. Claude Code settings are ready."
                 } else {
                     "Connection successful. Claude Code settings are ready."
